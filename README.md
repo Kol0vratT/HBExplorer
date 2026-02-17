@@ -7,8 +7,6 @@ It hooks `IDXGISwapChain::Present` via kiero, renders an ImGui UI, and exposes r
 
 ![HBExplorer UI](https://i.postimg.cc/mkxkG7FP/image.png)
 
-Suggested path: `docs/images/hbexplorer-ui.png`
-
 ## Core Features
 
 - DirectX 11 Present hook (`kiero` + `MinHook`) with ImGui render loop.
