@@ -14,6 +14,8 @@ bool init = false;
 bool g_ShowExplorer = false;
 float g_ExplorerUiAlpha = 0.0f;
 bool g_CursorApiHooksReady = false;
+bool g_MinHookInitialized = false;
+bool g_UnityLogHooksInstalled = false;
 POINT g_VirtualCursorPos{ 0, 0 };
 bool g_VirtualCursorInitialized = false;
 LONG g_RawMouseDeltaX = 0;
@@ -25,6 +27,294 @@ using SetCursorPos_t = BOOL(WINAPI*)(int, int);
 using ClipCursor_t = BOOL(WINAPI*)(const RECT*);
 SetCursorPos_t oSetCursorPos = nullptr;
 ClipCursor_t oClipCursor = nullptr;
+
+#ifdef _WIN64
+using UnityDebugLogAny_t = void(__fastcall*)(void*);
+#else
+using UnityDebugLogAny_t = void(__cdecl*)(void*);
+#endif
+UnityDebugLogAny_t oUnityDebugLog = nullptr;
+UnityDebugLogAny_t oUnityDebugLogWarning = nullptr;
+UnityDebugLogAny_t oUnityDebugLogError = nullptr;
+
+namespace HBLog
+{
+	namespace
+	{
+		std::mutex g_LogMutex;
+		std::deque<std::string> g_RuntimeLines;
+		std::string g_RuntimePartial;
+	}
+
+	static void PushLineLocked(std::string line)
+	{
+		const size_t nullPos = line.find('\0');
+		if (nullPos != std::string::npos)
+			line.resize(nullPos);
+
+		while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+			line.pop_back();
+
+		if (line.empty())
+			return;
+
+		constexpr size_t kMaxLineChars = 2048;
+		if (line.size() > kMaxLineChars)
+			line = line.substr(0, kMaxLineChars) + "...";
+
+		g_RuntimeLines.push_back(std::move(line));
+		constexpr size_t kMaxLines = 5000;
+		while (g_RuntimeLines.size() > kMaxLines)
+			g_RuntimeLines.pop_front();
+	}
+
+	static void AppendTextLocked(const char* text, size_t len)
+	{
+		if (!text || len == 0)
+			return;
+
+		for (size_t i = 0; i < len; ++i)
+		{
+			const char ch = text[i];
+			if (ch == '\r')
+				continue;
+
+			if (ch == '\n')
+			{
+				PushLineLocked(g_RuntimePartial);
+				g_RuntimePartial.clear();
+				continue;
+			}
+
+			g_RuntimePartial.push_back(ch);
+			if (g_RuntimePartial.size() > 4096)
+			{
+				PushLineLocked(g_RuntimePartial);
+				g_RuntimePartial.clear();
+			}
+		}
+	}
+
+	void Printf(const char* fmt, ...)
+	{
+		if (!fmt)
+			return;
+
+		char buffer[4096]{};
+		va_list args;
+		va_start(args, fmt);
+		const int written = std::vsnprintf(buffer, sizeof(buffer), fmt, args);
+		va_end(args);
+		if (written <= 0)
+			return;
+
+		const size_t bytesToWrite = (static_cast<size_t>(written) < (sizeof(buffer) - 1)) ? static_cast<size_t>(written) : (sizeof(buffer) - 1);
+
+		std::lock_guard<std::mutex> lock(g_LogMutex);
+		fwrite(buffer, 1, bytesToWrite, stdout);
+		fflush(stdout);
+		AppendTextLocked(buffer, bytesToWrite);
+	}
+
+	void Snapshot(std::vector<std::string>* outLines)
+	{
+		if (!outLines)
+			return;
+
+		std::lock_guard<std::mutex> lock(g_LogMutex);
+		outLines->assign(g_RuntimeLines.begin(), g_RuntimeLines.end());
+		if (!g_RuntimePartial.empty())
+			outLines->push_back(g_RuntimePartial);
+	}
+
+	void Clear()
+	{
+		std::lock_guard<std::mutex> lock(g_LogMutex);
+		g_RuntimeLines.clear();
+		g_RuntimePartial.clear();
+	}
+}
+
+static std::string TrimEmbeddedNull(std::string value)
+{
+	const size_t nullPos = value.find('\0');
+	if (nullPos != std::string::npos)
+		value.resize(nullPos);
+	return value;
+}
+
+static std::string SafeUnityStringToUtf8(Unity::System_String* value)
+{
+	if (!value)
+		return "<null>";
+
+	return TrimEmbeddedNull(value->ToString());
+}
+
+static std::string BuildUnityObjectPreview(Unity::il2cppObject* value)
+{
+	if (!value)
+		return "<null>";
+
+	Unity::il2cppClass* klass = value->m_pClass;
+	if (klass)
+	{
+		const char* ns = klass->m_pNamespace ? klass->m_pNamespace : "";
+		const char* name = klass->m_pName ? klass->m_pName : "";
+		if (std::strcmp(ns, "System") == 0 && std::strcmp(name, "String") == 0)
+			return SafeUnityStringToUtf8(reinterpret_cast<Unity::System_String*>(value));
+
+		char pointerBuf[64]{};
+		std::snprintf(pointerBuf, sizeof(pointerBuf), "%p", value);
+
+		std::string typeName;
+		if (ns[0] != '\0')
+		{
+			typeName += ns;
+			typeName += ".";
+		}
+		typeName += (name[0] != '\0') ? name : "<unnamed>";
+
+		return "<object " + typeName + " @" + pointerBuf + ">";
+	}
+
+	char pointerBuf[64]{};
+	std::snprintf(pointerBuf, sizeof(pointerBuf), "%p", value);
+	return std::string("<object @") + pointerBuf + ">";
+}
+
+static void EmitUnityLog(const char* level, Unity::il2cppObject* value)
+{
+	std::string text = BuildUnityObjectPreview(value);
+	if (text.empty())
+		text = "<empty>";
+
+	constexpr size_t kMaxChars = 1800;
+	if (text.size() > kMaxChars)
+		text = text.substr(0, kMaxChars) + "...";
+
+	HBLog::Printf("[Unity][%s] %s\n", level ? level : "Log", text.c_str());
+}
+
+#ifdef _WIN64
+void __fastcall hkUnityDebugLog(void* value)
+#else
+void __cdecl hkUnityDebugLog(void* value)
+#endif
+{
+	EmitUnityLog("Log", reinterpret_cast<Unity::il2cppObject*>(value));
+	if (oUnityDebugLog)
+		oUnityDebugLog(value);
+}
+
+#ifdef _WIN64
+void __fastcall hkUnityDebugLogWarning(void* value)
+#else
+void __cdecl hkUnityDebugLogWarning(void* value)
+#endif
+{
+	EmitUnityLog("Warning", reinterpret_cast<Unity::il2cppObject*>(value));
+	if (oUnityDebugLogWarning)
+		oUnityDebugLogWarning(value);
+}
+
+#ifdef _WIN64
+void __fastcall hkUnityDebugLogError(void* value)
+#else
+void __cdecl hkUnityDebugLogError(void* value)
+#endif
+{
+	EmitUnityLog("Error", reinterpret_cast<Unity::il2cppObject*>(value));
+	if (oUnityDebugLogError)
+		oUnityDebugLogError(value);
+}
+
+static bool CreateAndEnableRawHook(void* target, void* detour, void** original, const char* tag)
+{
+	if (!target || !detour)
+		return false;
+
+	MH_STATUS createStatus = MH_CreateHook(target, detour, original);
+	if (createStatus != MH_OK && createStatus != MH_ERROR_ALREADY_CREATED)
+	{
+		HBLog::Printf("[Core] MH_CreateHook failed for %s: %s\n", tag ? tag : "<hook>", MH_StatusToString(createStatus));
+		return false;
+	}
+
+	MH_STATUS enableStatus = MH_EnableHook(target);
+	if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED)
+	{
+		HBLog::Printf("[Core] MH_EnableHook failed for %s: %s\n", tag ? tag : "<hook>", MH_StatusToString(enableStatus));
+		return false;
+	}
+
+	return true;
+}
+
+void InitUnityLogHooks()
+{
+	if (g_UnityLogHooksInstalled)
+		return;
+
+	if (!IL2CPP::Functions.m_ResolveFunction || !IL2CPP::Domain::Get())
+		return;
+
+	static ULONGLONG s_LastAttemptMs = 0;
+	const ULONGLONG nowMs = GetTickCount64();
+	if ((nowMs - s_LastAttemptMs) < 1000)
+		return;
+	s_LastAttemptMs = nowMs;
+
+	MH_STATUS initStatus = MH_Initialize();
+	if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
+	{
+		HBLog::Printf("[Core] MinHook init failed for Unity log hooks: %s\n", MH_StatusToString(initStatus));
+		return;
+	}
+
+	g_MinHookInitialized = true;
+
+	void* pLog = IL2CPP::ResolveCallAny(
+		{
+			UNITY_DEBUG_LOG_OBJ,
+			UNITY_DEBUG_LOG_STR,
+			IL2CPP_RStr(UNITY_DEBUG_CLASS"::Log"),
+		});
+
+	void* pWarn = IL2CPP::ResolveCallAny(
+		{
+			UNITY_DEBUG_LOGWARN_OBJ,
+			UNITY_DEBUG_LOGWARN_STR,
+			IL2CPP_RStr(UNITY_DEBUG_CLASS"::LogWarning"),
+		});
+
+	void* pError = IL2CPP::ResolveCallAny(
+		{
+			UNITY_DEBUG_LOGERR_OBJ,
+			UNITY_DEBUG_LOGERR_STR,
+			IL2CPP_RStr(UNITY_DEBUG_CLASS"::LogError"),
+		});
+
+	if (!pLog)
+		pLog = IL2CPP::ResolveUnityMethod(UNITY_DEBUG_CLASS, "Log", 1);
+	if (!pWarn)
+		pWarn = IL2CPP::ResolveUnityMethod(UNITY_DEBUG_CLASS, "LogWarning", 1);
+	if (!pError)
+		pError = IL2CPP::ResolveUnityMethod(UNITY_DEBUG_CLASS, "LogError", 1);
+
+	if (!pLog && !pWarn && !pError)
+		return;
+
+	const bool okLog = CreateAndEnableRawHook(pLog, reinterpret_cast<void*>(hkUnityDebugLog), reinterpret_cast<void**>(&oUnityDebugLog), "Unity.Debug.Log");
+	const bool okWarn = CreateAndEnableRawHook(pWarn, reinterpret_cast<void*>(hkUnityDebugLogWarning), reinterpret_cast<void**>(&oUnityDebugLogWarning), "Unity.Debug.LogWarning");
+	const bool okErr = CreateAndEnableRawHook(pError, reinterpret_cast<void*>(hkUnityDebugLogError), reinterpret_cast<void**>(&oUnityDebugLogError), "Unity.Debug.LogError");
+
+	g_UnityLogHooksInstalled = okLog || okWarn || okErr;
+	HBLog::Printf("[Core] Unity log hooks: Log=%s Warn=%s Error=%s\n",
+		okLog ? "OK" : "FAIL",
+		okWarn ? "OK" : "FAIL",
+		okErr ? "OK" : "FAIL");
+}
 
 BOOL WINAPI hkSetCursorPos(int X, int Y)
 {
@@ -58,30 +348,31 @@ void InitCursorApiHooks()
 	MH_STATUS initStatus = MH_Initialize();
 	if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
 	{
-		std::printf("[Core] MinHook init failed: %s\n", MH_StatusToString(initStatus));
+		HBLog::Printf("[Core] MinHook init failed: %s\n", MH_StatusToString(initStatus));
 		return;
 	}
+	g_MinHookInitialized = true;
 
 	auto createAndEnableApiHook = [](LPCWSTR module, LPCSTR procName, LPVOID detour, LPVOID* original) -> bool
 		{
 			MH_STATUS createStatus = MH_CreateHookApi(module, procName, detour, original);
 			if (createStatus != MH_OK && createStatus != MH_ERROR_ALREADY_CREATED)
 			{
-				std::printf("[Core] MH_CreateHookApi failed for %s: %s\n", procName, MH_StatusToString(createStatus));
+				HBLog::Printf("[Core] MH_CreateHookApi failed for %s: %s\n", procName, MH_StatusToString(createStatus));
 				return false;
 			}
 
 			FARPROC target = GetProcAddress(GetModuleHandleW(module), procName);
 			if (!target)
 			{
-				std::printf("[Core] GetProcAddress failed for %s\n", procName);
+				HBLog::Printf("[Core] GetProcAddress failed for %s\n", procName);
 				return false;
 			}
 
 			MH_STATUS enableStatus = MH_EnableHook(reinterpret_cast<LPVOID>(target));
 			if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED)
 			{
-				std::printf("[Core] MH_EnableHook failed for %s: %s\n", procName, MH_StatusToString(enableStatus));
+				HBLog::Printf("[Core] MH_EnableHook failed for %s: %s\n", procName, MH_StatusToString(enableStatus));
 				return false;
 			}
 
@@ -92,7 +383,7 @@ void InitCursorApiHooks()
 	bool okClipCursor = createAndEnableApiHook(L"user32.dll", "ClipCursor", reinterpret_cast<LPVOID>(hkClipCursor), reinterpret_cast<LPVOID*>(&oClipCursor));
 
 	g_CursorApiHooksReady = okSetCursorPos && okClipCursor;
-	std::printf("[Core] Cursor API hooks: SetCursorPos=%s ClipCursor=%s\n",
+	HBLog::Printf("[Core] Cursor API hooks: SetCursorPos=%s ClipCursor=%s\n",
 		okSetCursorPos ? "OK" : "FAIL",
 		okClipCursor ? "OK" : "FAIL");
 }
@@ -194,9 +485,9 @@ void InitFileLogging()
 
 	SYSTEMTIME st{};
 	GetLocalTime(&st);
-	std::printf("\n========== HBExplorer session %04u-%02u-%02u %02u:%02u:%02u ==========\n",
+	HBLog::Printf("\n========== HBExplorer session %04u-%02u-%02u %02u:%02u:%02u ==========\n",
 		st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-	std::printf("[Core] File logging initialized: %ls\n", logPath.c_str());
+	HBLog::Printf("[Core] File logging initialized: %ls\n", logPath.c_str());
 }
 
 bool EnsureRenderIl2CppAttach()
@@ -209,7 +500,7 @@ bool EnsureRenderIl2CppAttach()
 		return false;
 
 	g_RenderIl2CppThread = IL2CPP::Thread::Attach(domain);
-	std::printf("[Core] Render thread IL2CPP attach: %p\n", g_RenderIl2CppThread);
+	HBLog::Printf("[Core] Render thread IL2CPP attach: %p\n", g_RenderIl2CppThread);
 	return g_RenderIl2CppThread != nullptr;
 }
 
@@ -246,7 +537,7 @@ void ForceSystemCursorForMenu()
 	if (!g_MenuCursorOverrideLogged)
 	{
 		g_MenuCursorOverrideLogged = true;
-		std::printf("[Core] Cursor override enabled for ImGui menu.\n");
+		HBLog::Printf("[Core] Cursor override enabled for ImGui menu.\n");
 	}
 }
 
@@ -260,7 +551,7 @@ void InitConsole()
 
 	InitFileLogging();
 	/*InitCursorApiHooks();*/
-	std::printf("[Core] Logging bootstrap complete.\n");
+	HBLog::Printf("[Core] Logging bootstrap complete.\n");
 }
 
 static ImVec4 MakeColor(unsigned char r, unsigned char g, unsigned char b, unsigned char a = 255)
@@ -392,7 +683,7 @@ static void LoadSmoothUiFont(ImGuiIO& io)
 	io.FontDefault = font;
 	io.FontGlobalScale = 1.0f;
 
-	std::printf("[Core] ImGui font: %s\n", loadedFromFile ? "TTF loaded (smooth)" : "default fallback");
+	HBLog::Printf("[Core] ImGui font: %s\n", loadedFromFile ? "TTF loaded (smooth)" : "default fallback");
 }
 
 static void DrawInjectionToast()
@@ -466,7 +757,7 @@ void InitImGui()
 	ImGui_ImplDX11_Init(pDevice, pContext);
 	g_InjectToastStartMs = GetTickCount64();
 	g_InjectToastActive = true;
-	std::printf("[Core] ImGui initialized.\n");
+	HBLog::Printf("[Core] ImGui initialized.\n");
 }
 
 LRESULT __stdcall WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
@@ -507,7 +798,8 @@ void Update()
 	{
 		g_ShowExplorer = !g_ShowExplorer;
 		/*ResetVirtualCursorState();*/
-		std::printf("[Core] Explorer visibility: %s\n", g_ShowExplorer ? "ON" : "OFF");
+		UExplorer::NotifyVisibilityChanged(g_ShowExplorer);
+		HBLog::Printf("[Core] Explorer visibility: %s\n", g_ShowExplorer ? "ON" : "OFF");
 	}
 }
 
@@ -537,7 +829,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
 					InitImGui();
 					init = true;
-					std::printf("[Core] Present hook initialization complete.\n");
+					HBLog::Printf("[Core] Present hook initialization complete.\n");
 				}
 			}
 		}
@@ -548,6 +840,9 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 
 	if (!init || !pContext || !mainRenderTargetView)
 		return oPresent(pSwapChain, SyncInterval, Flags);
+
+	if (!g_UnityLogHooksInstalled)
+		InitUnityLogHooks();
 
 	ImGui_ImplDX11_NewFrame();
 	ImGui_ImplWin32_NewFrame();
@@ -592,7 +887,8 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 			if (!explorerOpen)
 			{
 				g_ShowExplorer = false;
-				std::printf("[Core] Explorer visibility: OFF (closed by window)\n");
+				UExplorer::NotifyVisibilityChanged(false);
+				HBLog::Printf("[Core] Explorer visibility: OFF (closed by window)\n");
 			}
 		}
 	}
@@ -613,26 +909,28 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 DWORD WINAPI MainThread(LPVOID lpReserved)
 {
 	InitConsole();
-	std::printf("[Core] Main thread started.\n");
+	HBLog::Printf("[Core] Main thread started.\n");
 
 	bool init_hook = false;
 	do
 	{
 		if (kiero::init(kiero::RenderType::D3D11) == kiero::Status::Success)
 		{
-			std::printf("[Core] kiero initialized.\n");
+			HBLog::Printf("[Core] kiero initialized.\n");
 			kiero::bind(8, (void**)&oPresent, hkPresent);
-			std::printf("[Core] Present hook bound.\n");
+			HBLog::Printf("[Core] Present hook bound.\n");
 
 			const bool il2cppReady = IL2CPP::Initialize();
-			std::printf("[Core] IL2CPP::Initialize => %s\n", il2cppReady ? "OK" : "FAILED");
+			HBLog::Printf("[Core] IL2CPP::Initialize => %s\n", il2cppReady ? "OK" : "FAILED");
 			if (!il2cppReady)
 			{
 				Sleep(500);
 				continue;
 			}
 
-			std::printf("[Core] Input update is handled in hkPresent (no IL2CPP callback hook).\n");
+			InitUnityLogHooks();
+
+			HBLog::Printf("[Core] Input update is handled in hkPresent (no IL2CPP callback hook).\n");
 			init_hook = true;
 		}
 		else
@@ -641,7 +939,7 @@ DWORD WINAPI MainThread(LPVOID lpReserved)
 		}
 	} while (!init_hook);
 
-	std::printf("[Core] Main initialization finished.\n");
+	HBLog::Printf("[Core] Main initialization finished.\n");
 	return TRUE;
 }
 
@@ -655,11 +953,13 @@ BOOL WINAPI DllMain(HMODULE hMod, DWORD dwReason, LPVOID lpReserved)
 		break;
 	case DLL_PROCESS_DETACH:
 		kiero::shutdown();
-		if (g_CursorApiHooksReady)
+		if (g_MinHookInitialized)
 		{
+			MH_DisableHook(MH_ALL_HOOKS);
 			MH_Uninitialize();
+			g_MinHookInitialized = false;
 		}
-		std::printf("[Core] Detached, kiero shutdown.\n");
+		HBLog::Printf("[Core] Detached, kiero shutdown.\n");
 		break;
 	}
 	return TRUE;
