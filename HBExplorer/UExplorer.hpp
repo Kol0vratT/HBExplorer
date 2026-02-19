@@ -76,6 +76,9 @@ namespace UExplorer
 
         bool logAutoScroll = true;
         char logFilter[128]{};
+        bool showUExplorerLogs = false;
+        bool showCoreLogs = false;
+        bool showUnityLogs = true;
 
         bool pendingRefresh = false;
     };
@@ -2892,6 +2895,24 @@ namespace UExplorer
         return haystack.find(needle) != std::string::npos;
     }
 
+    static bool LogLinePassesCategory(const ExplorerState& state, const std::string& line)
+    {
+        const std::string lower = ToLowerCopy(line);
+        const bool isCore = (lower.find("[core]") != std::string::npos);
+        const bool isUExplorer = (lower.find("[uexplorer]") != std::string::npos);
+        const bool isUnity = (lower.find("[unity]") != std::string::npos);
+
+        if (isCore)
+            return state.showCoreLogs;
+        if (isUExplorer)
+            return state.showUExplorerLogs;
+        if (isUnity)
+            return state.showUnityLogs;
+
+        // Keep untagged lines visible (session header, continuations, stack lines).
+        return true;
+    }
+
     static ImVec4 GetLogLineColor(const std::string& line)
     {
         const std::string lower = ToLowerCopy(line);
@@ -2932,38 +2953,51 @@ namespace UExplorer
         ImGui::SameLine();
         ImGui::Checkbox("Auto-scroll", &state.logAutoScroll);
         ImGui::SameLine();
+        ImGui::Checkbox("Unity", &state.showUnityLogs);
+        ImGui::SameLine();
+        ImGui::Checkbox("Core", &state.showCoreLogs);
+        ImGui::SameLine();
+        ImGui::Checkbox("UExplorer", &state.showUExplorerLogs);
+        ImGui::SameLine();
         ImGui::SetNextItemWidth(280.0f);
         ImGui::InputText("Filter", state.logFilter, IM_ARRAYSIZE(state.logFilter));
 
+        std::vector<size_t> visibleIndices;
+        visibleIndices.reserve(liveLines.size());
+        for (size_t i = 0; i < liveLines.size(); ++i)
+        {
+            const std::string& line = liveLines[i];
+            if (!LogLinePassesCategory(state, line))
+                continue;
+            if (!LogLineMatchesFilter(state, line))
+                continue;
+
+            visibleIndices.push_back(i);
+        }
+
         ImGui::Separator();
-        ImGui::TextDisabled("Lines: %zu", liveLines.size());
+        ImGui::TextDisabled("Lines: %zu / %zu", visibleIndices.size(), liveLines.size());
         ImGui::Separator();
 
         if (ImGui::BeginChild("##LogsChild", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar))
         {
             const bool wasAtBottom = (ImGui::GetScrollY() >= (ImGui::GetScrollMaxY() - 4.0f));
-            const bool noFilter = (state.logFilter[0] == '\0');
-            if (noFilter)
+            if (visibleIndices.empty())
+            {
+                ImGui::TextDisabled("No lines for current filter/category.");
+            }
+            else
             {
                 ImGuiListClipper clipper;
-                clipper.Begin(static_cast<int>(liveLines.size()));
+                clipper.Begin(static_cast<int>(visibleIndices.size()));
                 while (clipper.Step())
                 {
                     for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i)
                     {
-                        const std::string& line = liveLines[static_cast<size_t>(i)];
+                        const size_t lineIndex = visibleIndices[static_cast<size_t>(i)];
+                        const std::string& line = liveLines[lineIndex];
                         ImGui::TextColored(GetLogLineColor(line), "%s", line.c_str());
                     }
-                }
-            }
-            else
-            {
-                for (const std::string& line : liveLines)
-                {
-                    if (!LogLineMatchesFilter(state, line))
-                        continue;
-
-                    ImGui::TextColored(GetLogLineColor(line), "%s", line.c_str());
                 }
             }
 
