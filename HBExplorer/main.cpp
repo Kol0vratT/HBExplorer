@@ -16,6 +16,8 @@ float g_ExplorerUiAlpha = 0.0f;
 bool g_CursorApiHooksReady = false;
 bool g_MinHookInitialized = false;
 bool g_UnityLogHooksInstalled = false;
+bool g_UnityLogHooksDisabledForCompatibility = false;
+bool g_UnityLogHookDecisionMade = false;
 POINT g_VirtualCursorPos{ 0, 0 };
 bool g_VirtualCursorInitialized = false;
 LONG g_RawMouseDeltaX = 0;
@@ -143,6 +145,121 @@ static std::string TrimEmbeddedNull(std::string value)
 	return value;
 }
 
+static std::string ToLowerTrimCopy(std::string value)
+{
+	auto isSpace = [](unsigned char c) -> bool { return std::isspace(c) != 0; };
+
+	while (!value.empty() && isSpace(static_cast<unsigned char>(value.front())))
+		value.erase(value.begin());
+	while (!value.empty() && isSpace(static_cast<unsigned char>(value.back())))
+		value.pop_back();
+
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c)
+		{
+			return static_cast<char>(std::tolower(c));
+		});
+
+	return value;
+}
+
+static bool TryReadBoolEnv(const char* envName, bool* outValue)
+{
+	if (!envName || !outValue)
+		return false;
+
+	char buffer[64]{};
+	const DWORD len = GetEnvironmentVariableA(envName, buffer, static_cast<DWORD>(sizeof(buffer)));
+	if (len == 0 || len >= sizeof(buffer))
+		return false;
+
+	const std::string normalized = ToLowerTrimCopy(std::string(buffer, len));
+	if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on")
+	{
+		*outValue = true;
+		return true;
+	}
+
+	if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off")
+	{
+		*outValue = false;
+		return true;
+	}
+
+	return false;
+}
+
+static bool TryParseUnityMajorVersion(const std::string& version, int* outMajor)
+{
+	if (!outMajor)
+		return false;
+
+	size_t i = 0;
+	while (i < version.size() && std::isspace(static_cast<unsigned char>(version[i])))
+		++i;
+
+	if (i >= version.size() || !std::isdigit(static_cast<unsigned char>(version[i])))
+		return false;
+
+	long long value = 0;
+	while (i < version.size() && std::isdigit(static_cast<unsigned char>(version[i])))
+	{
+		value = (value * 10) + static_cast<long long>(version[i] - '0');
+		if (value > 30000)
+			return false;
+		++i;
+	}
+
+	*outMajor = static_cast<int>(value);
+	return true;
+}
+
+static std::string GetUnityVersionStringForCompatibility()
+{
+	Unity::System_String* version = Unity::Application::GetUnityVersion();
+	if (!version)
+		return {};
+
+	return TrimEmbeddedNull(version->ToString());
+}
+
+static void EvaluateUnityLogHookCompatibility()
+{
+	if (g_UnityLogHookDecisionMade)
+		return;
+
+	g_UnityLogHookDecisionMade = true;
+
+	bool envForce = false;
+	if (TryReadBoolEnv("HBEXPLORER_FORCE_UNITY_LOG_HOOKS", &envForce) && envForce)
+	{
+		g_UnityLogHooksDisabledForCompatibility = false;
+		HBLog::Printf("[Core] Unity log hooks forced ON via HBEXPLORER_FORCE_UNITY_LOG_HOOKS.\n");
+		return;
+	}
+
+	const std::string unityVersion = GetUnityVersionStringForCompatibility();
+	int unityMajor = 0;
+	if (!TryParseUnityMajorVersion(unityVersion, &unityMajor))
+	{
+		g_UnityLogHooksDisabledForCompatibility = true;
+		HBLog::Printf("[Core] Unity version parse failed ('%s'). Unity log hooks disabled for compatibility.\n",
+			unityVersion.empty() ? "<empty>" : unityVersion.c_str());
+		HBLog::Printf("[Core] Set HBEXPLORER_FORCE_UNITY_LOG_HOOKS=1 to force-enable Unity log hooks.\n");
+		return;
+	}
+
+	if (unityMajor < 2019)
+	{
+		g_UnityLogHooksDisabledForCompatibility = true;
+		HBLog::Printf("[Core] Unity %s detected (<2019). Unity log hooks disabled for compatibility.\n", unityVersion.c_str());
+		HBLog::Printf("[Core] Set HBEXPLORER_FORCE_UNITY_LOG_HOOKS=1 to force-enable Unity log hooks.\n");
+		return;
+	}
+
+	g_UnityLogHooksDisabledForCompatibility = false;
+	HBLog::Printf("[Core] Unity %s detected. Unity log hooks compatibility: enabled.\n", unityVersion.c_str());
+}
+
 static std::string SafeUnityStringToUtf8(Unity::System_String* value)
 {
 	if (!value)
@@ -255,6 +372,20 @@ void InitUnityLogHooks()
 {
 	if (g_UnityLogHooksInstalled)
 		return;
+
+	if (!g_UnityLogHookDecisionMade)
+		EvaluateUnityLogHookCompatibility();
+
+	if (g_UnityLogHooksDisabledForCompatibility)
+	{
+		static bool s_CompatibilitySkipLogged = false;
+		if (!s_CompatibilitySkipLogged)
+		{
+			s_CompatibilitySkipLogged = true;
+			HBLog::Printf("[Core] Unity log hooks skipped by compatibility mode.\n");
+		}
+		return;
+	}
 
 	if (!IL2CPP::Functions.m_ResolveFunction || !IL2CPP::Domain::Get())
 		return;
@@ -841,9 +972,6 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
 	if (!init || !pContext || !mainRenderTargetView)
 		return oPresent(pSwapChain, SyncInterval, Flags);
 
-	if (!g_UnityLogHooksInstalled)
-		InitUnityLogHooks();
-
 	ImGui_ImplDX11_NewFrame();
 	ImGui_ImplWin32_NewFrame();
 	ImGui::NewFrame();
@@ -928,6 +1056,7 @@ DWORD WINAPI MainThread(LPVOID lpReserved)
 				continue;
 			}
 
+			EvaluateUnityLogHookCompatibility();
 			InitUnityLogHooks();
 
 			HBLog::Printf("[Core] Input update is handled in hkPresent (no IL2CPP callback hook).\n");
