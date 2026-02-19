@@ -11,10 +11,14 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdarg>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <fstream>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -33,5 +37,12 @@
 #include "kiero/minhook/include/MinHook.h"
 
 typedef HRESULT(__stdcall* Present)(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags);
+
+namespace HBLog
+{
+	void Printf(const char* fmt, ...);
+	void Snapshot(std::vector<std::string>* outLines);
+	void Clear();
+}
 
 #include "UExplorer.hpp"
