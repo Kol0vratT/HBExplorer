@@ -73,6 +73,11 @@ namespace UExplorer
         std::unordered_map<uint64_t, std::vector<std::string>> methodArgDrafts;
 
         void* fnRuntimeInvoke = nullptr;
+
+        bool logAutoScroll = true;
+        char logFilter[128]{};
+
+        bool pendingRefresh = false;
     };
 
     static ExplorerState& GetState()
@@ -164,7 +169,7 @@ namespace UExplorer
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            std::printf("[UExplorer] EXCEPTION: Object::GetName failed for %p.\n", obj);
+            HBLog::Printf("[UExplorer] EXCEPTION: Object::GetName failed for %p.\n", obj);
             return nullptr;
         }
     }
@@ -671,7 +676,7 @@ namespace UExplorer
 
         if (!state.methodResolvePrinted)
         {
-            std::printf("[UExplorer] Method resolve: Object.GetInstanceID=%p il2cpp_runtime_invoke=%p\n",
+            HBLog::Printf("[UExplorer] Method resolve: Object.GetInstanceID=%p il2cpp_runtime_invoke=%p\n",
                 state.fnObjectGetInstanceId,
                 state.fnRuntimeInvoke);
             state.methodResolvePrinted = true;
@@ -809,7 +814,11 @@ namespace UExplorer
         }
     }
 
-    using RuntimeInvokeFn = Unity::il2cppObject * (IL2CPP_CALLING_CONVENTION)(void*, void*, void**, void**);
+#ifdef _WIN64
+    using RuntimeInvokeFn = Unity::il2cppObject * (__fastcall*)(void*, void*, void**, void**);
+#else
+    using RuntimeInvokeFn = Unity::il2cppObject * (__cdecl*)(void*, void*, void**, void**);
+#endif
 
     static Unity::il2cppObject* SafeRuntimeInvokeCall(
         RuntimeInvokeFn runtimeInvoke,
@@ -860,7 +869,7 @@ namespace UExplorer
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            std::printf("[UExplorer] EXCEPTION: FindObjectsOfType<UnityEngine.GameObject> failed.\n");
+            HBLog::Printf("[UExplorer] EXCEPTION: FindObjectsOfType<UnityEngine.GameObject> failed.\n");
             return nullptr;
         }
     }
@@ -876,7 +885,7 @@ namespace UExplorer
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            std::printf("[UExplorer] EXCEPTION: GameObject::GetTransform failed for %p.\n", gameObject);
+            HBLog::Printf("[UExplorer] EXCEPTION: GameObject::GetTransform failed for %p.\n", gameObject);
             return nullptr;
         }
     }
@@ -892,7 +901,7 @@ namespace UExplorer
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            std::printf("[UExplorer] EXCEPTION: Transform::GetParent failed for %p.\n", transform);
+            HBLog::Printf("[UExplorer] EXCEPTION: Transform::GetParent failed for %p.\n", transform);
             return nullptr;
         }
     }
@@ -908,7 +917,7 @@ namespace UExplorer
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            std::printf("[UExplorer] EXCEPTION: GameObject::GetComponents failed for %p.\n", gameObject);
+            HBLog::Printf("[UExplorer] EXCEPTION: GameObject::GetComponents failed for %p.\n", gameObject);
             return nullptr;
         }
     }
@@ -924,7 +933,7 @@ namespace UExplorer
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            std::printf("[UExplorer] EXCEPTION: GameObject array access failed at index %u.\n", index);
+            HBLog::Printf("[UExplorer] EXCEPTION: GameObject array access failed at index %u.\n", index);
             return nullptr;
         }
     }
@@ -944,7 +953,7 @@ namespace UExplorer
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            std::printf("[UExplorer] EXCEPTION: reading object class failed for %p.\n", object);
+            HBLog::Printf("[UExplorer] EXCEPTION: reading object class failed for %p.\n", object);
             return false;
         }
     }
@@ -1276,7 +1285,7 @@ namespace UExplorer
             {
                 state.selectedObject = previous;
                 state.transformEditTarget = nullptr;
-                std::printf("[UExplorer] Navigate back -> %s\n", SafeGetObjectName(previous).c_str());
+                HBLog::Printf("[UExplorer] Navigate back -> %s\n", SafeGetObjectName(previous).c_str());
                 return true;
             }
         }
@@ -1620,7 +1629,7 @@ namespace UExplorer
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            std::printf("[UExplorer] EXCEPTION: reading transform values failed for %p.\n", gameObject);
+            HBLog::Printf("[UExplorer] EXCEPTION: reading transform values failed for %p.\n", gameObject);
             return;
         }
 
@@ -1674,7 +1683,7 @@ namespace UExplorer
 
         if (state.lastSceneCountLogged != sceneCount)
         {
-            std::printf("[UExplorer] Scene cache refreshed: %d scene(s).\n", sceneCount);
+            HBLog::Printf("[UExplorer] Scene cache refreshed: %d scene(s).\n", sceneCount);
             state.lastSceneCountLogged = sceneCount;
         }
 
@@ -1760,7 +1769,7 @@ namespace UExplorer
 
         if (state.lastObjectCountLogged != state.objects.size())
         {
-            std::printf("[UExplorer] Object cache refreshed: %zu object(s).\n", state.objects.size());
+            HBLog::Printf("[UExplorer] Object cache refreshed: %zu object(s).\n", state.objects.size());
             state.lastObjectCountLogged = state.objects.size();
         }
 
@@ -1934,7 +1943,7 @@ namespace UExplorer
             if (state.sceneToLoad[0] != '\0')
             {
                 Unity::SceneManager::LoadScene(state.sceneToLoad, Unity::LoadSceneMode::Single);
-                std::printf("[UExplorer] LoadScene single: %s\n", state.sceneToLoad);
+                HBLog::Printf("[UExplorer] LoadScene single: %s\n", state.sceneToLoad);
                 ForceRefresh(state);
             }
         }
@@ -1944,7 +1953,7 @@ namespace UExplorer
             if (state.sceneToLoad[0] != '\0')
             {
                 Unity::SceneManager::LoadScene(state.sceneToLoad, Unity::LoadSceneMode::Additive);
-                std::printf("[UExplorer] LoadScene additive: %s\n", state.sceneToLoad);
+                HBLog::Printf("[UExplorer] LoadScene additive: %s\n", state.sceneToLoad);
                 ForceRefresh(state);
             }
         }
@@ -2411,7 +2420,7 @@ namespace UExplorer
                         if (ImGui::Checkbox("Value", &value))
                         {
                             const bool ok = WriteFieldValue(component, field, isStatic, value);
-                            std::printf("[UExplorer] Field bool apply %s: %s.%s = %s (%s)\n",
+                            HBLog::Printf("[UExplorer] Field bool apply %s: %s.%s = %s (%s)\n",
                                 ok ? "OK" : "FAILED",
                                 component->m_Object.m_pClass ? component->m_Object.m_pClass->m_pName : "<class>",
                                 fieldName.c_str(),
@@ -2439,7 +2448,7 @@ namespace UExplorer
                             if (ApplyFieldDraftValue(component, field, isStatic, typeEnum, draftIt->second))
                             {
                                 draftIt->second = BuildFieldDraftFromCurrentValue(component, field, isStatic, typeEnum);
-                                std::printf("[UExplorer] Field apply OK: %s.%s = %s (%s)\n",
+                                HBLog::Printf("[UExplorer] Field apply OK: %s.%s = %s (%s)\n",
                                     component->m_Object.m_pClass ? component->m_Object.m_pClass->m_pName : "<class>",
                                     fieldName.c_str(),
                                     draftIt->second.c_str(),
@@ -2447,7 +2456,7 @@ namespace UExplorer
                             }
                             else
                             {
-                                std::printf("[UExplorer] Field apply FAILED: %s.%s input='%s'\n",
+                                HBLog::Printf("[UExplorer] Field apply FAILED: %s.%s input='%s'\n",
                                     component->m_Object.m_pClass ? component->m_Object.m_pClass->m_pName : "<class>",
                                     fieldName.c_str(),
                                     draftIt->second.c_str());
@@ -2470,7 +2479,7 @@ namespace UExplorer
 
                         if (preview.readFailed)
                         {
-                            std::printf("[UExplorer] Read ref FAILED: %s.%s (%s)\n",
+                            HBLog::Printf("[UExplorer] Read ref FAILED: %s.%s (%s)\n",
                                 component->m_Object.m_pClass ? component->m_Object.m_pClass->m_pName : "<class>",
                                 fieldName.c_str(),
                                 isStatic ? "static" : "instance");
@@ -2500,13 +2509,13 @@ namespace UExplorer
                             if (refObject)
                             {
                                 NavigateToReferencedObject(state, refObject);
-                                std::printf("[UExplorer] Navigate reference: %s -> %s\n",
+                                HBLog::Printf("[UExplorer] Navigate reference: %s -> %s\n",
                                     fieldName.c_str(),
                                     SafeGetObjectName(refObject).c_str());
                             }
                             else
                             {
-                                std::printf("[UExplorer] Inspect Ref failed: %s (ref=%p)\n",
+                                HBLog::Printf("[UExplorer] Inspect Ref failed: %s (ref=%p)\n",
                                     fieldName.c_str(),
                                     refValue);
                             }
@@ -2678,14 +2687,14 @@ namespace UExplorer
                 if (InvokeMethodViaRuntimeInvoke(state, component, method, draftIt->second, &invokeResult))
                 {
                     state.methodInvokeResults[methodKey] = invokeResult;
-                    std::printf("[UExplorer] Method invoke OK: %s -> %s\n", methodName.c_str(), invokeResult.c_str());
+                    HBLog::Printf("[UExplorer] Method invoke OK: %s -> %s\n", methodName.c_str(), invokeResult.c_str());
                 }
                 else
                 {
                     if (invokeResult.empty())
                         invokeResult = "<invoke-failed>";
                     state.methodInvokeResults[methodKey] = invokeResult;
-                    std::printf("[UExplorer] Method invoke FAILED: %s -> %s\n", methodName.c_str(), invokeResult.c_str());
+                    HBLog::Printf("[UExplorer] Method invoke FAILED: %s -> %s\n", methodName.c_str(), invokeResult.c_str());
                 }
             }
             ImGui::EndDisabled();
@@ -2855,7 +2864,7 @@ namespace UExplorer
                     state.editLocalScale[1],
                     state.editLocalScale[2]));
 
-                std::printf("[UExplorer] Applied transform to '%s'.\n", SafeGetObjectName(gameObject).c_str());
+                HBLog::Printf("[UExplorer] Applied transform to '%s'.\n", SafeGetObjectName(gameObject).c_str());
             }
 
             ImGui::SameLine();
@@ -2873,13 +2882,106 @@ namespace UExplorer
         ImGui::End();
     }
 
+    static bool LogLineMatchesFilter(const ExplorerState& state, const std::string& line)
+    {
+        if (state.logFilter[0] == '\0')
+            return true;
+
+        const std::string haystack = ToLowerCopy(line);
+        const std::string needle = ToLowerCopy(std::string(state.logFilter));
+        return haystack.find(needle) != std::string::npos;
+    }
+
+    static ImVec4 GetLogLineColor(const std::string& line)
+    {
+        const std::string lower = ToLowerCopy(line);
+        if (lower.find("error") != std::string::npos || lower.find("exception") != std::string::npos)
+            return ImVec4(0.95f, 0.45f, 0.45f, 1.0f);
+
+        if (lower.find("warning") != std::string::npos || lower.find("warn") != std::string::npos)
+            return ImVec4(0.98f, 0.78f, 0.42f, 1.0f);
+
+        if (lower.find("[core]") != std::string::npos)
+            return ImVec4(0.56f, 0.86f, 0.93f, 1.0f);
+
+        if (lower.find("[uexplorer]") != std::string::npos)
+            return ImVec4(0.62f, 0.90f, 0.72f, 1.0f);
+
+        if (lower.find("[unity]") != std::string::npos)
+            return ImVec4(0.86f, 0.86f, 0.90f, 1.0f);
+
+        return ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    }
+
+    static void DrawLogsWindow(ExplorerState& state)
+    {
+        std::vector<std::string> liveLines;
+        HBLog::Snapshot(&liveLines);
+
+        if (!ImGui::Begin("Logs", nullptr, ImGuiWindowFlags_NoCollapse))
+        {
+            ImGui::End();
+            return;
+        }
+
+        if (AnimatedButton("Clear"))
+        {
+            HBLog::Clear();
+            liveLines.clear();
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("Auto-scroll", &state.logAutoScroll);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(280.0f);
+        ImGui::InputText("Filter", state.logFilter, IM_ARRAYSIZE(state.logFilter));
+
+        ImGui::Separator();
+        ImGui::TextDisabled("Lines: %zu", liveLines.size());
+        ImGui::Separator();
+
+        if (ImGui::BeginChild("##LogsChild", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar))
+        {
+            const bool wasAtBottom = (ImGui::GetScrollY() >= (ImGui::GetScrollMaxY() - 4.0f));
+            const bool noFilter = (state.logFilter[0] == '\0');
+            if (noFilter)
+            {
+                ImGuiListClipper clipper;
+                clipper.Begin(static_cast<int>(liveLines.size()));
+                while (clipper.Step())
+                {
+                    for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i)
+                    {
+                        const std::string& line = liveLines[static_cast<size_t>(i)];
+                        ImGui::TextColored(GetLogLineColor(line), "%s", line.c_str());
+                    }
+                }
+            }
+            else
+            {
+                for (const std::string& line : liveLines)
+                {
+                    if (!LogLineMatchesFilter(state, line))
+                        continue;
+
+                    ImGui::TextColored(GetLogLineColor(line), "%s", line.c_str());
+                }
+            }
+
+            if (state.logAutoScroll && wasAtBottom)
+                ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
+
+        ImGui::End();
+    }
+
     static bool EnsureReady(ExplorerState& state)
     {
         if (!IL2CPP::Domain::Get())
         {
             if (!state.waitingLogPrinted)
             {
-                std::printf("[UExplorer] Waiting for IL2CPP domain...\n");
+                HBLog::Printf("[UExplorer] Waiting for IL2CPP domain...\n");
                 state.waitingLogPrinted = true;
             }
             return false;
@@ -2890,10 +2992,24 @@ namespace UExplorer
             ResolveRuntimeMethods(state);
             ForceRefresh(state);
             state.initialized = true;
-            std::printf("[UExplorer] Initialized.\n");
+            HBLog::Printf("[UExplorer] Initialized.\n");
         }
 
         return true;
+    }
+
+    void NotifyVisibilityChanged(bool visible)
+    {
+        ExplorerState& state = GetState();
+        if (visible)
+        {
+            state.pendingRefresh = true;
+            return;
+        }
+
+        state.selectedObject = nullptr;
+        state.transformEditTarget = nullptr;
+        state.navigationHistory.clear();
     }
 
     void Draw(bool* pOpen)
@@ -2905,11 +3021,34 @@ namespace UExplorer
         if (!EnsureReady(state))
             return;
 
+        if (state.pendingRefresh)
+        {
+            ForceRefresh(state);
+            state.pendingRefresh = false;
+        }
+
         TickRefresh(state);
 
         ImGuiViewport* viewport = ImGui::GetMainViewport();
         const ImVec2 origin = viewport->WorkPos;
         const ImVec2 size = viewport->WorkSize;
+        const float panelTop = origin.y + 12.0f;
+        const float panelHeight = size.y - 24.0f;
+        const float rightPanelX = origin.x + size.x * 0.34f;
+        const float rightPanelWidth = size.x * 0.64f;
+        const float rightPanelSpacing = 8.0f;
+
+        float logsHeight = panelHeight * 0.30f;
+        if (logsHeight < 170.0f) logsHeight = 170.0f;
+        if (logsHeight > panelHeight * 0.55f) logsHeight = panelHeight * 0.55f;
+        float inspectorHeight = panelHeight - logsHeight - rightPanelSpacing;
+        if (inspectorHeight < 220.0f)
+        {
+            inspectorHeight = 220.0f;
+            logsHeight = panelHeight - inspectorHeight - rightPanelSpacing;
+            if (logsHeight < 120.0f)
+                logsHeight = 120.0f;
+        }
 
         ImGui::SetNextWindowPos(ImVec2(origin.x + 12.0f, origin.y + 12.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(size.x * 0.32f, size.y - 24.0f), ImGuiCond_FirstUseEver);
@@ -2935,8 +3074,12 @@ namespace UExplorer
         }
         ImGui::End();
 
-        ImGui::SetNextWindowPos(ImVec2(origin.x + size.x * 0.34f, origin.y + 12.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(size.x * 0.64f, size.y - 24.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(rightPanelX, panelTop), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(rightPanelWidth, inspectorHeight), ImGuiCond_Always);
         DrawInspectorWindow(state);
+
+        ImGui::SetNextWindowPos(ImVec2(rightPanelX, panelTop + inspectorHeight + rightPanelSpacing), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(rightPanelWidth, logsHeight), ImGuiCond_Always);
+        DrawLogsWindow(state);
     }
 }
